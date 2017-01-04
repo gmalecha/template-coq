@@ -158,3 +158,44 @@ Inductive demoList (A : Set) : Set :=
     demoNil : demoList A | demoCons : A -> demoList A -> demoList A
 *)
 
+
+(** Putting the above commands in monadic program *)
+
+Definition printTerm (name  : ident): TemplateMonad unit :=
+  (tmBind (tmQuote name true) tmPrint).
+
+Definition duplicateDefn (name newName : ident): TemplateMonad unit :=
+  (tmBind (tmQuote name false) (fun body => 
+    match body with
+    | Some (inl bd) => 
+        (tmBind (tmPrint body) (fun _ => tmMkDefinition true newName bd))
+    | _ => tmReturn tt
+    end))
+    .
+
+
+
+Run TemplateProgram (duplicateDefn "add" "addUnq").
+Check (eq_refl: add=addUnq).
+
+Run TemplateProgram (printTerm "Coq.Init.Datatypes.nat").
+Run TemplateProgram (printTerm "nat"). 
+
+CoInductive cnat : Set :=  O :cnat | S : cnat -> cnat.
+Run TemplateProgram (printTerm "cnat"). 
+
+Run TemplateProgram
+  ((tmBind (tmQuote "demoList" false) (fun body =>
+    match body with
+    | Some (inl bd)
+    | Some (inr bd) =>
+        tmMkDefinition false "demoList_syntax" bd
+    | N_ => tmReturn tt
+    end))
+    ).
+
+Example unquote_quote_id1: demoList_syntax=mut_list_i (* demoList was obtained from mut_list_i *).
+  reflexivity.
+Qed.
+
+Run TemplateProgram (printTerm "Coq.Arith.PeanoNat.Nat.add").

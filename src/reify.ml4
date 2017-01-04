@@ -78,10 +78,16 @@ struct
   let cSome = resolve_symbol pkg_datatypes "Some"
   let cNone = resolve_symbol pkg_datatypes "None"
   let tfalse = resolve_symbol pkg_datatypes "false"
+  let unit_tt = resolve_symbol pkg_datatypes "tt"
   let tAscii = resolve_symbol ["Coq";"Strings";"Ascii"] "Ascii"
   let c_nil = resolve_symbol pkg_datatypes "nil"
   let c_cons = resolve_symbol pkg_datatypes "cons"
   let prod_type = resolve_symbol pkg_datatypes "prod"
+  let sum_type = resolve_symbol pkg_datatypes "sum"
+  let option_type = resolve_symbol pkg_datatypes "option"
+  let bool_type = resolve_symbol pkg_datatypes "bool"
+  let cInl = resolve_symbol pkg_datatypes "inl"
+  let cInr = resolve_symbol pkg_datatypes "inr"
   let prod a b =
     Term.mkApp (prod_type, [| a ; b |])
   let c_pair = resolve_symbol pkg_datatypes "pair"
@@ -109,12 +115,22 @@ struct
      r_reify "tConstruct", r_reify "tConst", r_reify "tInd", r_reify "tUnknown")
       
   let (tdef,tmkdef) = (r_reify "def", r_reify "mkdef")
-  let (tLocalDef,tLocalAssum) = (r_reify "LocalDef", r_reify "LocalAssum")
+  let (tLocalDef,tLocalAssum,tlocal_entry) = (r_reify "LocalDef", r_reify "LocalAssum", r_reify "local_entry")
+
   let (cFinite,cCoFinite,cBiFinite) = (r_reify "Finite", r_reify "CoFinite", r_reify "BiFinite")
   let (pConstr,pType,pAxiom,pIn) =
     (r_reify "PConstr", r_reify "PType", r_reify "PAxiom", r_reify "PIn")
   let tinductive_body = r_reify "inductive_body"
   let tmkinductive_body = r_reify "mkinductive_body"
+
+  let tMutual_inductive_entry = r_reify "mutual_inductive_entry"
+  let tOne_inductive_entry = r_reify "one_inductive_entry"
+  let tBuild_mutual_inductive_entry = r_reify "Build_mutual_inductive_entry"
+  let tBuild_one_inductive_entry = r_reify "Build_one_inductive_entry"
+  
+  let (tmReturn,tmBind,tmQuote,tmQuoteTermRec,tmReduce,tmMkDefinition,tmMkInductive, tmPrint, tmQuoteTerm) =
+    (r_reify "tmReturn", r_reify "tmBind", r_reify "tmQuote", r_reify "tmQuoteTermRec", r_reify "tmReduce",
+       r_reify "tmMkDefinition", r_reify "tmMkInductive", r_reify "tmPrint", r_reify "tmQuoteTerm")
 
   let to_positive =
     let xH = resolve_symbol pkg_bignums "xH" in
@@ -447,6 +463,120 @@ struct
     in List.fold_left (fun acc x -> Term.mkApp (x, [| acc |]))
                       (Term.mkApp (pIn, [| x |])) !constants
 
+ let to_coq_bool b = if b then ttrue else tfalse
+
+ let quote_one_ind envA envC (mi:Entries.one_inductive_entry) : Term.constr =
+   Declarations.(
+     Entries.(
+   let iname = quote_ident mi.mind_entry_typename  in
+   let arity = quote_term envA mi.mind_entry_arity in 
+   let templatePoly = to_coq_bool mi.mind_entry_template in
+   let consnames = to_coq_list tident (List.map quote_ident (mi.mind_entry_consnames)) in
+   let cons_types = to_coq_list tTerm (List.map (quote_term envC) (mi.mind_entry_lc)) in
+   Term.mkApp (tBuild_one_inductive_entry, [| iname; arity; templatePoly; consnames; cons_types |])))
+
+let process_local_entry 
+  (f: 'a -> Term.constr option (* body *) -> Term.constr (* type *) -> Names.Id.t -> Environ.env -> 'a) 
+  ((env,a):(Environ.env*'a)) 
+  ((n,le):(Names.Id.t * Entries.local_entry))
+  :  (Environ.env * 'a) =
+  match le with
+  | Entries.LocalAssum t -> (Environ.push_rel (Names.Name n,None,t) env, f a None t n env)
+  | Entries.LocalDef b -> 
+      let typ = Retyping.get_type_of env Evd.empty b in
+      (Environ.push_rel (Names.Name n, Some b, typ) env, f a (Some b) typ n env)
+
+
+let quote_mind_params env (params:(Names.Id.t * Entries.local_entry) list)
+  :  Environ.env*(Term.constr list)=
+  let pair i l = pair tident tlocal_entry i l in 
+  let f lr ob t n env =
+    match ob with
+    | Some b ->  (pair (quote_ident n) (Term.mkApp (tLocalDef,[|(quote_term env b)|])))::lr
+    | None ->  (pair (quote_ident n) (Term.mkApp (tLocalAssum,[|(quote_term env t)|])))::lr in
+    let (env, params) = List.fold_left (process_local_entry f) (env,[]) (List.rev params) in (env, List.rev params)
+    
+let mind_params_as_types ((env,t):Environ.env*Term.constr) (params:(Names.Id.t * Entries.local_entry) list) : 
+   Environ.env*Term.constr =
+    List.fold_left (process_local_entry (fun tr ob typ n env -> Term.mkProd_or_LetIn (Names.Name n,ob,typ) tr)) (env,t) 
+      (List.rev params)
+
+let quote_mind_finiteness (f: Decl_kinds.recursivity_kind) =
+  match f with
+  | Decl_kinds.Finite -> cFinite
+  | Decl_kinds.CoFinite -> cCoFinite
+  | Decl_kinds.BiFinite -> cBiFinite
+     
+let quote_mut_ind  env (mi:Declarations.mutual_inductive_body) : Term.constr =
+   let t= Discharge.process_inductive ([],Univ.UContext.empty) (Names.Cmap.empty,Names.Mindmap.empty) mi in
+   Declarations.(
+     Entries.(
+   let the_prod = Term.mkApp (prod_type,[|tident; tlocal_entry|]) in 
+   let mr = Term.mkApp (cNone, [|Term.mkApp (option_type, [|tident|])|])  in
+   let mf = quote_mind_finiteness t.mind_entry_finite in 
+   let mp = to_coq_list the_prod (snd (quote_mind_params env (t.mind_entry_params))) in
+   (* before quoting the types of constructors, we need to enrich the environment with the inductives *)
+   let one_arities =
+      List.map 
+        (fun x -> (x.mind_entry_typename,
+           snd (mind_params_as_types (env,x.mind_entry_arity) (t.mind_entry_params)))) 
+      t.mind_entry_inds in
+  (* env for quoting constructors of inductives. First push inductices, then params *)
+   let envC = List.fold_left (fun env p -> Environ.push_rel (Names.Name (fst p), None, snd p) env) env (one_arities) in
+   let (envC,_) = List.fold_left (process_local_entry (fun _ _ _ _ _ -> ())) (envC,()) (List.rev (t.mind_entry_params)) in
+  (* env for quoting arities of inductives -- just push the params *)
+   let (envA,_) = List.fold_left (process_local_entry (fun _ _ _ _ _ -> ())) (env,()) (List.rev (t.mind_entry_params)) in
+   let is = to_coq_list tOne_inductive_entry (List.map (quote_one_ind envA envC) (t.mind_entry_inds)) in
+   let mpol = tfalse in
+   let mpr = Term.mkApp (cNone, [|bool_type|]) in
+   Term.mkApp (tBuild_mutual_inductive_entry, [| mr; mf; mp; is; mpol; mpr |]);
+  ))
+
+  let split_name s : (Names.DirPath.t * Names.Id.t)=
+    let ss = List.rev (Str.split (Str.regexp (Str.quote ".")) s) in
+    match ss with
+      nm :: rst ->
+    	let dp = (Names.make_dirpath (List.map Names.id_of_string rst)) in (dp, Names.Id.of_string nm)
+    | [] -> raise (Failure "Empty name cannot be quoted")
+
+  let kn_of_canonical_string s =
+    let ss = List.rev (Str.split (Str.regexp (Str.quote ".")) s) in
+    match ss with
+      nm :: rst ->
+	let rec to_mp ls = Names.MPfile (Names.make_dirpath (List.map Names.id_of_string ls)) in
+	let mp = to_mp rst in
+	Names.make_kn mp Names.empty_dirpath (Names.mk_label nm)
+    | _ -> assert false
+
+ let quote_decl bypass env evm (name:string) =
+   let opType = Term.mkApp(sum_type, [|tTerm;tMutual_inductive_entry|]) in
+   let mkSome c t = Term.mkApp (cSome, [|opType; Term.mkApp (c, [|tTerm;tMutual_inductive_entry; t|] )|]) in
+   let mkSomeDef = mkSome cInl in
+   let mkSomeInd  = mkSome cInr in
+   let (dp, nm) = split_name name in
+   try 
+   match Nametab.locate (Libnames.make_qualid dp nm) with
+   |Globnames.ConstRef c ->
+      let cd = Environ.lookup_constant c env in
+	    Declarations.(
+	      match cd.const_body with
+		    | Undef _ -> Term.mkApp (cNone, [|opType|])
+	      | Def cs -> mkSomeDef (quote_term (Global.env ()) (Mod_subst.force_constr cs))
+	      | OpaqueDef cs -> 
+      if bypass 
+      then mkSomeDef (quote_term (Global.env ()) (Opaqueproof.force_proof (Global.opaque_tables ()) cs))
+      else Term.mkApp (cNone, [|opType|])
+      )
+    | Globnames.IndRef ni ->
+        let c = Environ.lookup_mind (fst ni) env in (* FIX: For efficienctly, we should also export (snd ni)*)
+        let miq = quote_mut_ind env c in
+        mkSomeInd miq
+    | Globnames.ConstructRef _ -> Term.mkApp (cNone, [|opType|]) (* FIX: return the enclusing mutual inductive *)
+    | Globnames.VarRef _ -> (* what is this *)Term.mkApp (cNone, [|opType|])
+    with 
+    Not_found -> 
+          Term.mkApp (cNone, [|opType|])   
+
   let rec app_full trm acc =
     match Term.kind_of_term trm with
       Term.App (f, xs) -> app_full f (Array.to_list xs @ acc)
@@ -481,6 +611,11 @@ struct
       | _ -> assert false
     else
       not_supported trm
+
+let reduce_all env (evm,def) =
+  	let (evm2,red) = Tacinterp.interp_redexp env evm (Genredexpr.Cbv Redops.all_flags) in
+	  let red = fst (Redexpr.reduction_of_red_expr env red) in
+	  red env evm2 def
 
   let unquote_string trm =
     let rec go n trm =
@@ -537,14 +672,7 @@ struct
     else
       raise (Failure "ill-typed, expected sort")
 
-  let kn_of_canonical_string s =
-    let ss = List.rev (Str.split (Str.regexp (Str.quote ".")) s) in
-    match ss with
-      nm :: rst ->
-	let rec to_mp ls = Names.MPfile (Names.make_dirpath (List.map Names.id_of_string ls)) in
-	let mp = to_mp rst in
-	Names.make_kn mp Names.empty_dirpath (Names.mk_label nm)
-    | _ -> assert false
+
 
   let denote_inductive trm =
     let (h,args) = app_full trm [] in
@@ -631,6 +759,21 @@ struct
 	  Term.mkApp (denote_term f,
 		      Array.of_list (List.map denote_term (from_coq_list xs)))
       | _ -> raise (Failure "ill-typed (app)")
+    else if Term.eq_constr h tConst then
+      match args with
+    	s :: [] ->
+        let s = (unquote_string s) in
+        let (dp, nm) = split_name s in
+        (try 
+          match Nametab.locate (Libnames.make_qualid dp nm) with
+          | Globnames.ConstRef c ->  Term.mkConst c
+          | Globnames.IndRef _ -> raise (Failure (String.concat "the constant is an inductive. use tInd : " [s]))
+          | Globnames.VarRef _ -> raise (Failure (String.concat "the constant is a variable. use tVar : " [s]))
+          | Globnames.ConstructRef _ -> raise (Failure (String.concat "the constant is a consructor. use tConstructor : " [s]))
+        with
+        Not_found ->   raise (Failure (String.concat "Constant not found : " [s])))
+
+      | _ -> raise (Failure "ill-typed (tConst)")
     else if Term.eq_constr h tConstructor then
       match args with
 	i :: idx :: _ ->
@@ -656,8 +799,54 @@ struct
 	  Term.mkCase (ci, denote_term ty, denote_term d,
 			Array.of_list (List.map denote_branch (from_coq_list brs)))
       | _ -> raise (Failure "ill-typed (case)")
+    else if Term.eq_constr h tFix then
+      match args with
+	    bds :: i :: _ ->
+        let unquoteFbd  b : ((Term.constr * Term.constr) * (Term.constr * Term.constr)) =
+          let (_,args) = app_full b [] in
+          match args with
+          | _(*type*)::a::b::c::d::[] -> ((a,b),(c,d))
+          |_ -> raise (Failure " (mkdef must take exactly 5 arguments)")
+          in
+        let lbd = List.map unquoteFbd (from_coq_list bds) in
+        let (p1,p2) = (List.map fst lbd, List.map snd lbd) in
+        let (names,types,bodies,rargs) = (List.map fst p1, List.map snd p1, List.map fst p2, List.map snd p2) in
+        let (types,bodies) = (List.map denote_term types, List.map denote_term bodies) in
+        let (names,rargs) = (List.map unquote_name names, List.map nat_to_int rargs) in
+        let la = Array.of_list in
+        Term.mkFix ((la rargs,nat_to_int i), (la names, la types, la bodies))
+      | _ -> raise (Failure "tFix takes exactly 2 arguments")
     else
       not_supported trm
+
+  let declare_definition
+    (id : Names.Id.t) (loc, boxed_flag, def_obj_kind)
+    (binder_list : Constrexpr.local_binder list) red_expr_opt (constr_expr : Constrexpr.constr_expr)
+    constr_expr_opt decl_hook =
+    Command.do_definition
+    id (loc, false, def_obj_kind) None binder_list red_expr_opt constr_expr
+    constr_expr_opt decl_hook
+
+  let add_definition name result =
+    declare_definition name
+	    (Decl_kinds.Global, false, Decl_kinds.Definition)
+	    [] None result None (Lemmas.mk_hook (fun _ _ -> ()))
+
+  let reduce_hnf env (evm,def) =
+  	let (evm2,red) = Tacinterp.interp_redexp env evm Genredexpr.Hnf in
+	  let red = fst (Redexpr.reduction_of_red_expr env red) in
+	  red env evm2 def
+
+  let reduce_all env (evm,def) =
+  	let (evm2,red) = Tacinterp.interp_redexp env evm (Genredexpr.Cbv Redops.all_flags) in
+	  let red = fst (Redexpr.reduction_of_red_expr env red) in
+	  red env evm2 def
+
+  let unquote_red_add_definition b env evm name def =
+	  let (evm,def) = reduce_all env (evm,def) in
+  	let trm = if b then denote_term def else def in
+	  let result = Constrextern.extern_constr true env evm trm in
+    add_definition name result
 
   let denote_local_entry trm =
     let (h,args) = app_full trm [] in
@@ -691,7 +880,6 @@ struct
     else
       not_supported trm
 
-
   let declare_inductive (env: Environ.env) (evm: Evd.evar_map) (body: Constrexpr.constr_expr) : unit =
 	let (body,_) = Constrintern.interp_constr env evm body in
   let (evm,body) = reduce_all env (evm,body) in
@@ -724,6 +912,58 @@ struct
       Command.declare_mutual_inductive_with_eliminations (mut_ind mr mf mp mi mpol mpr) [] [];()
     | _ -> raise (Failure "ill-typed mutual_inductive_entry")
 
+  let rec run_template_program_rec  ((env,evm,pgm): Environ.env * Evd.evar_map * Term.constr) : Environ.env * Evd.evar_map * Term.constr =
+    let (evm,pgm) = reduce_hnf env (evm, pgm) in 
+    let (coConstr,args) = app_full pgm [] in
+    if Term.eq_constr coConstr tmReturn then
+      match args with
+      | _::h::[] -> (env,evm,h)
+      | _ -> raise (Failure "tmReturn must take 2 arguments. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmBind then
+      match args with
+      | _::_::a::f::[] ->
+        let (env, evm, ar) = run_template_program_rec (env,evm,a) in
+        run_template_program_rec (env,evm,(Term.mkApp (f, Array.of_list [ar])))
+      | _ -> raise (Failure "tmBind must take 4 arguments. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmMkDefinition then
+      match args with
+      | b::name::_::body::[] -> 
+        let (evm,name) = reduce_all env (evm,name) in
+        let (evm,b) = reduce_all env (evm,b) in
+        let _ = unquote_red_add_definition (from_bool b) env evm (unquote_ident name) body in (env, evm, unit_tt)
+      | _ -> raise (Failure "tmMkDefinition must take 4 arguments. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmQuote then
+      match args with
+      | id::b::[] ->
+          let (evm,id) = reduce_all env (evm,id) in
+          let (evm,b) = reduce_all env (evm,b) in
+          let qt=quote_decl (from_bool b) env evm (unquote_string id) in
+          (env, evm, qt)
+      | _ -> raise (Failure "tmQuote must take 1 argument. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmQuoteTerm then
+      match args with
+      | _::trm::[] -> let qt = quote_term env trm in (* user should do the reduction (using tmReduce) if they want *)
+              (env, evm, qt)
+      | _ -> raise (Failure "tmQuoteTerm must take 1 argument. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmQuoteTermRec then
+      match args with
+      | trm::[] -> let qt = quote_term_rec env trm in
+              (env, evm, qt)
+      | _ -> raise (Failure "tmQuoteTermRec must take 1 argument. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmPrint then
+      match args with
+      | _::trm::[] -> let _ = Pp.msg_debug ((Printer.pr_constr trm)) in (env, evm, unit_tt)
+      | _ -> raise (Failure "tmPrint must take 2 arguments. Please file a bug with Template-Coq.")
+    else if Term.eq_constr coConstr tmReduce then
+      match args with
+      | _(*reduction strategy*)::_(*type*)::trm::[] -> 
+          let (evm,trm) = reduce_all env (evm,trm) in (env, evm, trm)
+      | _ -> raise (Failure "tmReduce must take 3 arguments. Please file a bug with Template-Coq.")
+    else raise (Failure "Invalid argument or yot yet implemented. The argument must be a TemplateProgram")
+
+  let run_template_program (env: Environ.env) (evm: Evd.evar_map) (body: Constrexpr.constr_expr) : unit =
+  	let (body,_) = Constrintern.interp_constr env evm body in
+    let _ = run_template_program_rec (env,evm,body) in ()
 end
 
 DECLARE PLUGIN "template_plugin"
@@ -747,13 +987,6 @@ let ltac_apply (f:Tacexpr.glob_tactic_expr) (args:Tacexpr.glob_tactic_arg list) 
 let to_ltac_val c = Tacexpr.TacDynamic(Loc.ghost,Pretyping.constr_in c)
 
 (** From Containers **)
-let declare_definition
-    (id : Names.Id.t) (loc, boxed_flag, def_obj_kind)
-    (binder_list : Constrexpr.local_binder list) red_expr_opt constr_expr
-    constr_expr_opt decl_hook =
-  Command.do_definition
-  id (loc, false, def_obj_kind) None binder_list red_expr_opt constr_expr
-  constr_expr_opt decl_hook
 
 let check_inside_section () =
   if Lib.sections_are_opened () then
@@ -798,7 +1031,7 @@ VERNAC COMMAND EXTEND Make_vernac CLASSIFIED AS SIDEFF
 	let def = Constrintern.interp_constr env evm def in
 	let trm = TermReify.quote_term env (fst def) in
 	let result = Constrextern.extern_constr true env evm trm in
-	declare_definition name
+	TermReify.declare_definition name
 	  (Decl_kinds.Global, false, Decl_kinds.Definition)
 	  [] None result None (Lemmas.mk_hook (fun _ _ -> ())) ]
 END;;
@@ -813,7 +1046,7 @@ VERNAC COMMAND EXTEND Make_vernac_reduce CLASSIFIED AS SIDEFF
 	let def = red env evm2 (fst def) in
 	let trm = TermReify.quote_term env (snd def) in
 	let result = Constrextern.extern_constr true env (fst def) trm in
-	declare_definition name
+	TermReify.declare_definition name
 	  (Decl_kinds.Global, false, Decl_kinds.Definition)
 	  [] None result None (Lemmas.mk_hook (fun _ _ -> ())) ]
 END;;
@@ -826,7 +1059,7 @@ VERNAC COMMAND EXTEND Make_recursive CLASSIFIED AS SIDEFF
 	let def = Constrintern.interp_constr env evm def in
 	let trm = TermReify.quote_term_rec env (fst def) in
 	let result = Constrextern.extern_constr true env evm trm in
-	declare_definition name
+	TermReify.declare_definition name
 	  (Decl_kinds.Global, false, Decl_kinds.Definition)
 	  [] None result None (Lemmas.mk_hook (fun _ _ -> ())) ]
 END;;
@@ -838,7 +1071,7 @@ VERNAC COMMAND EXTEND Unquote_vernac CLASSIFIED AS SIDEFF
 	let def = Constrintern.interp_constr env evm def in
 	let trm = TermReify.denote_term (fst def) in
 	let result = Constrextern.extern_constr true env evm trm in
-	declare_definition name
+	TermReify.declare_definition name
 	  (Decl_kinds.Global, false, Decl_kinds.Definition)
 	  [] None result None (Lemmas.mk_hook (fun _ _ -> ())) ]
 END;;
@@ -848,6 +1081,13 @@ VERNAC COMMAND EXTEND Unquote_inductive CLASSIFIED AS SIDEFF
       [ check_inside_section () ;
 	let (evm,env) = Lemmas.get_current_context () in
   TermReify.declare_inductive env evm def ]
+END;;
+
+VERNAC COMMAND EXTEND Run_program CLASSIFIED AS SIDEFF
+    | [ "Run" "TemplateProgram" constr(def) ] ->
+      [ check_inside_section () ;
+	let (evm,env) = Lemmas.get_current_context () in
+  TermReify.run_template_program env evm def ]
 END;;
 
 VERNAC COMMAND EXTEND Make_tests CLASSIFIED AS QUERY
