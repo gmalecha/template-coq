@@ -1,6 +1,8 @@
 template-coq
 ============
 
+**Template Coq development has moved:** https://github.com/Template-Coq/template-coq
+
 Template Coq is a quoting library for Coq. It takes Coq terms and constructs a representation of their syntax tree as a Coq inductive data type.
 The representation is based on the kernel's term representation. Reasoning about this data type can only be done informally, i.e. there is no Coq function that can take this syntax and produce its meaning.
 
